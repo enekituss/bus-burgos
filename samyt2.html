@@ -42,10 +42,6 @@
             border-radius: 0;
         }
         
-        /* Oculta los popups estándar de Leaflet, ya que usamos un modal */
-        /* .leaflet-popup-pane { display: none; } */ 
-        /* COMENTADO: Para los buses queremos popups pequeños estilo tooltip, para paradas el modal */
-
         /* --- ESTILOS DE MARCADOR DE BUS --- */
         .bus-icon {
             border: 3px solid white;
@@ -338,6 +334,11 @@
         let currentView = VIEWS.MENU;
         let lineId = null;
         let targetBusIdOnLoad = null;
+        
+        // --- CONTROL DE CONCURRENCIA (NUEVO) ---
+        // Este ID aumenta con cada operación importante. Si una petición asíncrona vuelve
+        // y este ID ha cambiado, la petición se descarta para evitar sobrescribir el mapa.
+        let currentOperationId = 0;
 
         const ALL_LINES = [
             '01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12', '13', '14', '15', '16', '17',
@@ -496,6 +497,9 @@
         }
         
         function navigate(view, newLineId = null, updateHistory = true) {
+            // Incrementar ID de operación para cancelar procesos pendientes
+            currentOperationId++;
+            
             currentView = view;
             lineId = newLineId;
             targetBusIdOnLoad = null;
@@ -622,6 +626,13 @@
         function hideLoading() { loadingOverlay.classList.add('hidden'); }
 
         function showStatus(message, isError = false) {
+            // SI hay error pero ya hay datos en el mapa, no mostrar el mensaje de error para no molestar
+            if (isError && !mapContainerWrapper.classList.contains('hidden') && routeLineLayer.getLayers().length > 0) {
+                console.warn("Error silenciado para no limpiar el mapa:", message);
+                hideLoading();
+                return;
+            }
+
             const targetId = currentView === VIEWS.STOP_MAP ? 'status-message-stop-map' : (currentView === VIEWS.BUS_SEARCH ? 'status-message-bus-search' : 'status-message-line-view');
             const statusBox = document.getElementById(targetId);
             if (!mapContainerWrapper.classList.contains('hidden')) hideLoading();
@@ -668,17 +679,36 @@
              for (let i = 0; i < retries; i++) {
                  try {
                      const headers = new Headers(); headers.append('Referer', BASE_URL); 
-                     const response = await fetch(CORS_PROXY + encodeURIComponent(url), { headers: headers });
+                     // Timeout de 10s para evitar cuelgues eternos
+                     const controller = new AbortController();
+                     const id = setTimeout(() => controller.abort(), 10000);
+                     
+                     const response = await fetch(CORS_PROXY + encodeURIComponent(url), { 
+                         headers: headers,
+                         signal: controller.signal 
+                     });
+                     clearTimeout(id);
+
                      if (!response.ok) throw new Error(response.status);
                      const text = await response.text();
+                     
                      if (!text || text.trim() === 'null' || text.trim() === '[]') return [];
                      let jsonText = text.startsWith('URL_DECODED:') ? decodeURIComponent(text.replace('URL_DECODED:', '')) : text;
-                     return JSON.parse(jsonText);
+                     
+                     try {
+                        return JSON.parse(jsonText);
+                     } catch(e) {
+                        return []; // Si falla el parseo, devolver vacío en vez de error
+                     }
                  } catch (error) {
-                     if (i === retries - 1) throw error;
+                     if (i === retries - 1) {
+                         console.warn("Fetch failed:", url, error);
+                         return []; // Devolver array vacío en lugar de lanzar excepción para no romper la UI
+                     }
                      await new Promise(resolve => setTimeout(resolve, 500));
                  }
              }
+             return [];
          }
 
         async function fetchBurgosAPI(resourceId, lineId = '', extraParams = {}) { 
@@ -689,8 +719,9 @@
              dynamicParams.set(PORTLET_PREFIX + 'label', lineId || '01');
              for (const key in extraParams) dynamicParams.set(PORTLET_PREFIX + key, extraParams[key]);
              const targetUrl = `${BASE_URL}?${BASE_PARAMS}&p_p_resource_id=${resourceId}&${dynamicParams.toString()}`;
-             try { return await fetchWithRetry(targetUrl, 3, resourceId === 'resourceVehicles'); } 
-             catch (error) { if(resourceId !== 'resourceVehicles') showStatus(`Error API: ${error.message}`, true); throw error; }
+             
+             // No lanzamos error aquí, fetchWithRetry devuelve [] si falla
+             return await fetchWithRetry(targetUrl, 3, resourceId === 'resourceVehicles');
          }
         
         // --- Init ---
@@ -756,13 +787,28 @@
         }
 
         async function loadRouteVariants(lineId) {
+            const thisOpId = ++currentOperationId; // Guardamos ID de operación actual
+            
             try {
                 showLoading(`Cargando Línea ${lineId}...`);
                 map.setView([42.3459, -3.6969], 14); 
+                
                 const routeData = await fetchBurgosAPI('resourceRoutes', lineId);
+                
+                // Si el usuario cambió de línea mientras cargaba, abortar
+                if (thisOpId !== currentOperationId) return;
+
                 allRoutes[lineId] = routeData;
                 routeVariantSelectLine.innerHTML = '<option value="">Seleccione un sentido</option>';
-                if (!routeData || routeData.length === 0) { showStatus(`Línea ${lineId} sin datos.`, false); clearMapLayers(); stopLineMonitor(); routeVariantSelectLine.disabled = true; hideLoading(); return; }
+                
+                if (!routeData || routeData.length === 0) { 
+                    // No limpiar mapa si falla, solo notificar
+                    showStatus(`Línea ${lineId} sin datos de ruta.`, false); 
+                    routeVariantSelectLine.disabled = true; 
+                    hideLoading(); 
+                    return; 
+                }
+                
                 routeData.forEach(variant => {
                     const option = document.createElement('option');
                     option.value = variant.id;
@@ -770,8 +816,10 @@
                     routeVariantSelectLine.appendChild(option);
                 });
                 routeVariantSelectLine.disabled = false;
+                
                 const params = new URLSearchParams(window.location.search);
                 const selectedVariantId = params.get('variant') || routeData[0].id;
+                
                 if (routeData.some(v => v.id === selectedVariantId)) {
                     routeVariantSelectLine.value = selectedVariantId;
                     await handleRouteVariantChange({ target: routeVariantSelectLine, updateURL: false });
@@ -779,18 +827,31 @@
                     routeVariantSelectLine.value = routeData[0].id;
                     await handleRouteVariantChange({ target: routeVariantSelectLine });
                 }
-            } catch (error) { showStatus(`Error al cargar Línea ${lineId}.`, true); clearMapLayers(); stopLineMonitor(); } finally { hideLoading(); }
+            } catch (error) { 
+                if (thisOpId === currentOperationId) showStatus(`Error al cargar Línea ${lineId}.`, true); 
+            } finally { 
+                if (thisOpId === currentOperationId) hideLoading(); 
+            }
         }
         
         async function handleRouteVariantChange(event) {
+            const thisOpId = ++currentOperationId; // Guardamos ID de operación actual
+            
             const variantId = event.target.value;
-            if (!variantId || !lineId) { clearMapLayers(); stopLineMonitor(); return; }
+            if (!variantId || !lineId) return;
             
             showLoading("Dibujando ruta...");
             
             try {
                 if (event.updateURL !== false) updateURL();
-                await renderRouteAndStops(lineId, variantId);
+                
+                // Renderizar ruta y paradas
+                await renderRouteAndStops(lineId, variantId, thisOpId);
+                
+                // Si la operación cambió durante el renderizado, salir
+                if (thisOpId !== currentOperationId) return;
+
+                // Iniciar monitor solo si seguimos en la misma operación
                 await startLineMonitor(lineId);
 
                 // Enfoque bus
@@ -799,13 +860,14 @@
                     if (marker) { map.setView(marker.getLatLng(), 17); marker.fire('click'); }
                     targetBusIdOnLoad = null;
                 }
+                
                 showStatus(`Línea ${lineId} cargada.`, false);
                 map.invalidateSize();
             } catch (e) {
                 console.error("Error cambiando variante:", e);
-                showStatus("Error al dibujar la ruta.", true);
+                // No mostrar error crítico si simplemente se canceló
             } finally {
-                hideLoading(); 
+                if (thisOpId === currentOperationId) hideLoading(); 
             }
         }
 
@@ -814,14 +876,22 @@
             clearMapLayers();
             allStopMarkers.clear();
             stopSearchResults.innerHTML = '';
+            
+            const thisOpId = ++currentOperationId;
+
             if (Object.keys(allStopData).length === 0) {
                 showLoading("Cargando todas las paradas...");
                 try {
                     const allNodesData = await fetchBurgosAPI('resourceNodes', ''); 
+                    if (thisOpId !== currentOperationId) return; // Abortar si cambió la vista
+                    
                     if (!allNodesData) return;
                     allNodesData.forEach(node => allStopData[node.num.toString()] = node);
                 } catch (error) { showStatus('Error al cargar paradas.', true); hideLoading(); return; }
             }
+            
+            if (thisOpId !== currentOperationId) return;
+
             Object.values(allStopData).forEach(node => {
                 const marker = createStopMarker(node.lat, node.lng, node.num.toString(), node.name, 'ALL_STOPS');
                 allStopMarkers.set(node.num.toString(), marker);
@@ -869,9 +939,12 @@
              return marker;
          }
 
-        async function renderRouteAndStops(lineId, variantId) {
-            routeLineLayer.clearLayers(); stopMarkersLayer.clearLayers(); 
-            // NO limpiamos busMarkers aquí para evitar parpadeos, se limpiará en updateBusMarkers
+        async function renderRouteAndStops(lineId, variantId, opId) {
+            // Verificación de operación antes de limpiar capas
+            if (opId !== currentOperationId) return;
+
+            routeLineLayer.clearLayers(); 
+            stopMarkersLayer.clearLayers(); 
             
             stopDataCache[lineId] = stopDataCache[lineId] || {};
             const variant = allRoutes[lineId].find(v => v.id === variantId);
@@ -891,6 +964,9 @@
                 nodesData = Object.values(allStopData).filter(node => required.has(node.num.toString()));
             } else {
                 nodesData = await fetchBurgosAPI('resourceNodes', lineId); 
+                // Verificar operación nuevamente tras fetch
+                if (opId !== currentOperationId) return;
+                
                 nodesData.forEach(node => { allStopData[node.num.toString()] = node; stopDataCache[lineId][node.num.toString()] = node; });
             }
             const nodesMap = new Map(nodesData.map(node => [node.num.toString(), node])); 
@@ -903,11 +979,18 @@
             });
         }
 
-        function stopLineMonitor() { if (currentLineMonitorInterval) { clearInterval(currentLineMonitorInterval); currentLineMonitorInterval = null; } }
+        function stopLineMonitor() { 
+            if (currentLineMonitorInterval) { 
+                clearInterval(currentLineMonitorInterval); 
+                currentLineMonitorInterval = null; 
+            } 
+        }
         
         async function startLineMonitor(lineId) {
             stopLineMonitor();
             const poller = async () => {
+                // Verificar que seguimos en la vista correcta antes de actualizar
+                if (currentView !== VIEWS.LINE_VIEW) return; 
                 try {
                     const vehiclesData = await fetchBurgosAPI('resourceVehicles', lineId);
                     updateBusMarkers(lineId, vehiclesData);
